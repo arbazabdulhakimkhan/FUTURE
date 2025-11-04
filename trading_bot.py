@@ -1,4 +1,3 @@
-# bot.py
 import os, time, json, traceback, threading
 from datetime import datetime, timedelta, timezone
 import ccxt
@@ -11,7 +10,10 @@ import requests
 # =========================
 MODE = os.getenv("MODE", "paper").lower()                # "paper" or "live"
 EXCHANGE_ID = "kucoinfutures"                            # futures engine
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "ARB/USDT:USDT,LINK/USDT:USDT,SOL/USDT:USDT,ETH/USDT:USDT,BTC/USDT:USDT").split(",") if s.strip()]
+SYMBOLS = [s.strip() for s in os.getenv(
+    "SYMBOLS",
+    "ARB/USDT:USDT,LINK/USDT:USDT,SOL/USDT:USDT,ETH/USDT:USDT,BTC/USDT:USDT"
+).split(",") if s.strip()]
 
 ENTRY_TF = os.getenv("ENTRY_TF", "1h")
 HTF = os.getenv("HTF", "4h")
@@ -21,7 +23,7 @@ TOTAL_PORTFOLIO_CAPITAL = float(os.getenv("TOTAL_PORTFOLIO_CAPITAL", "10000"))
 PER_COIN_ALLOCATION = float(os.getenv("PER_COIN_ALLOCATION", "0.20"))
 PER_COIN_CAP_USD = TOTAL_PORTFOLIO_CAPITAL * PER_COIN_ALLOCATION
 
-# strategy (same vibe as yours)
+# strategy (same as your spot logic, mirrored for short)
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.02"))
 RR_FIXED = float(os.getenv("RR_FIXED", "5.0"))
 DYNAMIC_RR = os.getenv("DYNAMIC_RR", "true").lower() == "true"
@@ -43,13 +45,12 @@ RSI_OVERBOUGHT = 100 - RSI_OVERSOLD
 BIAS_CONFIRM_BEAR = int(os.getenv("BIAS_CONFIRM_BEAR", "2"))
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "0.0"))
 
-# risk/fees (KuCoin taker 0.06%)
+# risk/fees (KuCoin taker ~0.06% each side; slippage tiny)
 MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.20"))
-MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "100000"))  # base cap (coins)
-SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0005"))
-FEE_RATE = float(os.getenv("FEE_RATE", "0.0006"))              # 0.06% each side
+MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "100000"))  # base qty cap
+SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0005"))    # 0.05%
+FEE_RATE = float(os.getenv("FEE_RATE", "0.0006"))              # 0.06%
 INCLUDE_FUNDING = os.getenv("INCLUDE_FUNDING", "true").lower() == "true"
-FUNDING_INTERVAL_HOURS = 8
 
 # telegram (separate bot for futures)
 TELEGRAM_TOKEN_FUT = os.getenv("TELEGRAM_TOKEN_FUT", "")
@@ -64,7 +65,7 @@ API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE", "")
 SEND_DAILY_SUMMARY = os.getenv("SEND_DAILY_SUMMARY", "true").lower() == "true"
 SUMMARY_HOUR_IST = int(os.getenv("SUMMARY_HOUR", "20"))  # 8 PM IST default
 
-SLEEP_CAP = int(os.getenv("SLEEP_CAP", "60"))  # cap large sleeps
+SLEEP_CAP = int(os.getenv("SLEEP_CAP", "60"))  # cap huge sleeps
 LOG_PREFIX = "[FUT-BOT]"
 
 if MODE == "live":
@@ -90,19 +91,13 @@ def send_telegram_fut(msg: str):
 # EXCHANGE & DATA
 # =========================
 def get_exchange():
+    cfg = {
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},  # perps
+    }
     if MODE == "live":
-        return ccxt.kucoinfutures({
-            "apiKey": API_KEY,
-            "secret": API_SECRET,
-            "password": API_PASSPHRASE,
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap"},  # ✅ perps
-        })
-    else:
-        return ccxt.kucoinfutures({
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap"},  # ✅ perps
-        })
+        cfg.update({"apiKey": API_KEY, "secret": API_SECRET, "password": API_PASSPHRASE})
+    return ccxt.kucoinfutures(cfg)
 
 def timeframe_to_ms(tf: str) -> int:
     tf = tf.strip().lower()
@@ -119,19 +114,23 @@ def fetch_ohlcv_range(exchange, symbol, timeframe, since_ms, until_ms, limit=150
             batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=limit)
         except ccxt.RateLimitExceeded:
             time.sleep(1); continue
-        except Exception as e:
-            print("fetch_ohlcv error:", e); break
-        if not batch: break
+        except Exception:
+            break
+        if not batch:
+            break
         out.extend(batch)
         newest = batch[-1][0]
         cursor = (newest + tf_ms) if (last is None or newest > last) else cursor + tf_ms
         last = newest
-        if newest >= until_ms - tf_ms: break
+        if newest >= until_ms - tf_ms:
+            break
         time.sleep(pause)
-    if not out: return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+    if not out:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
     dedup = {r[0]: r for r in out}
     rows = [dedup[k] for k in sorted(dedup.keys()) if since_ms <= k <= until_ms]
     df = pd.DataFrame(rows, columns=["timestamp","Open","High","Low","Close","Volume"])
+    # keep tz-naive UTC across the app (so no tz subtraction bugs)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(None)
     df.set_index("timestamp", inplace=True)
     for c in ["Open","High","Low","Close","Volume"]:
@@ -140,31 +139,51 @@ def fetch_ohlcv_range(exchange, symbol, timeframe, since_ms, until_ms, limit=150
 
 # funding rates
 def fetch_funding_history(exchange, symbol, since_ms, until_ms):
-    rates, cursor = [], since_ms
-    while cursor < until_ms:
-        try:
+    """Return DataFrame(index=timestamp-naive UTC, columns=['rate']) or None on failure."""
+    try:
+        rates, cursor = [], since_ms
+        while cursor < until_ms:
             page = exchange.fetchFundingRateHistory(symbol, since=cursor, limit=1000)
-        except Exception as e:
-            print("Funding history error:", e); break
-        if not page: break
-        rates += page
-        newest = page[-1]['timestamp']
-        if newest <= cursor: break
-        cursor = newest + 1
-        time.sleep(0.1)
-    if not rates:
-        return pd.DataFrame(columns=["rate"])
-    df = pd.DataFrame([{"ts": r['timestamp'], "rate": float(r.get('fundingRate', r.get('info',{}).get('fundingRate', 0.0)))} for r in rates])
-    df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(None)
-    df = df.drop(columns=["ts"]).set_index("timestamp").sort_index()
-    return df[~df.index.duplicated(keep="last")]
+            if not page:
+                break
+            rates += page
+            newest = page[-1].get('timestamp') or page[-1].get('ts')
+            if newest is None or newest <= cursor:
+                break
+            cursor = newest + 1
+            time.sleep(0.1)
+        if not rates:
+            return None
+        df = pd.DataFrame([
+            {
+                "ts": r.get("timestamp") or r.get("ts"),
+                "rate": float(
+                    r.get("fundingRate", 0.0) or
+                    (r.get("info", {}).get("fundingRate", 0.0) if isinstance(r.get("info", {}), dict) else 0.0)
+                ),
+            }
+            for r in rates
+            if (r.get("timestamp") or r.get("ts")) is not None
+        ])
+        if df.empty:
+            return None
+        df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(None)
+        df = df.drop(columns=["ts"]).set_index("timestamp").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        return df
+    except Exception:
+        return None  # silent fallback
 
 def align_funding_to_index(idx, funding_df):
+    """Return a Series aligned to idx with funding rates (0.0 when missing)."""
     s = pd.Series(0.0, index=idx)
-    if funding_df is None or funding_df.empty: return s
+    if funding_df is None or funding_df.empty:
+        return s
+    # mark the bar after funding timestamp (typical funding applies at settlement)
     for ts, row in funding_df.iterrows():
         j = s.index.searchsorted(ts)
-        if j < len(s): s.iloc[j] = row["rate"]
+        if j < len(s):
+            s.iloc[j] = row["rate"]
     return s
 
 # =========================
@@ -276,7 +295,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
         h1['Avg_Volume'] = h1['Volume'].rolling(VOL_LOOKBACK).mean()
     h1['RSI'] = calculate_rsi(h1['Close'], RSI_PERIOD)
 
-    # entry signals (last closed bar only)
+    # last closed bar
     i = len(h1) - 1
     curr = h1.iloc[i]
     prev_close = h1['Close'].iloc[i-1] if i >= 1 else curr['Close']
@@ -284,7 +303,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
     bias = int(curr['Bias']); h4t = int(curr['H4_Trend'])
     ts = h1.index[i]
 
-    # funding at this bar (if we were holding)
+    # funding impact at settlement bar
     if INCLUDE_FUNDING and state["position"] != 0 and funding_series is not None:
         try:
             rate = float(funding_series.iloc[i]) if i < len(funding_series) else 0.0
@@ -292,7 +311,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             rate = 0.0
         if rate != 0.0 and state["entry_price"] and state["entry_size"]:
             notional = abs(state["entry_price"] * state["entry_size"])
-            # longs pay when rate>0; shorts receive. (PnL impact negative when you pay).
             fee = notional * rate * (1 if state["position"] == 1 else -1) * (-1)
             state["capital"] += fee
 
@@ -300,7 +318,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
     state["peak_equity"] = max(state["peak_equity"], state["capital"])
     dd = (state["peak_equity"] - state["capital"]) / state["peak_equity"] if state["peak_equity"] > 0 else 0.0
     if dd >= MAX_DRAWDOWN and state["position"] != 0:
-        # force close at price
         side = "sell" if state["position"] == 1 else "buy"
         exit_price = price
         if MODE == "live":
@@ -322,14 +339,13 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             "PnL_$": round(pnl,2), "Win": 1 if pnl>0 else 0,
             "Exit_Reason": "MAX DRAWDOWN", "Capital_After": round(state["capital"],2), "Mode": MODE
         }
-        # reset
         state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"bearish_count":0})
-        state["last_exit_time"] = ts  # ← track for cooldown
+        state["last_exit_time"] = ts
         return state, row
 
     trade_row = None
 
-    # ===== EXIT LOGIC (close-based) =====
+    # ===== EXIT LOGIC =====
     if state["position"] != 0:
         exit_flag = False; exit_reason = ""; exit_price = price
         if state["position"] == 1:
@@ -373,6 +389,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     exit_price = float(avg_fill_price(order) or price)
                 except Exception as e:
                     send_telegram_fut(f"❌ {symbol} exit failed: {e}")
+
             gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
             pos_val = abs(exit_price * state["entry_size"])
             pnl = gross - pos_val*SLIPPAGE_RATE - pos_val*FEE_RATE
@@ -388,7 +405,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 "Exit_Reason": exit_reason, "Capital_After": round(state["capital"],2), "Mode": MODE
             }
             state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0})
-            state["last_exit_time"] = ts  # ← update cooldown anchor
+            state["last_exit_time"] = ts
 
             emoji = "💚" if pnl>0 else "❤️"
             send_telegram_fut(f"{emoji} EXIT {symbol} {exit_reason} @ {exit_price:.4f} | PnL ${pnl:.2f}")
@@ -402,7 +419,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     state["last_processed_ts"] = ts
                     return state, trade_row
             except Exception:
-                # if parsing weird, just allow entry next bar
                 pass
 
         bullish_sweep = (price > open_price) and (price > prev_close)
@@ -414,7 +430,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             avgv = h1['Volume'].rolling(VOL_LOOKBACK).mean().iloc[i]
             if not pd.isna(avgv):
                 vol_ok_long = h1['Volume'].iloc[i] >= VOL_MIN_RATIO * avgv
-                vol_ok_short = vol_ok_long  # same logic
+                vol_ok_short = vol_ok_long
 
         rsi = float(h1['RSI'].iloc[i]) if not pd.isna(h1['RSI'].iloc[i]) else None
         rsi_ok_long = True if rsi is None else rsi > RSI_OVERSOLD
@@ -462,7 +478,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                             if ep is not None: entry_price_used = float(ep)
                         except Exception as e:
                             send_telegram_fut(f"❌ {symbol} entry failed: {e}")
-                            # skip if failed live order
                             state["last_processed_ts"] = ts
                             return state, trade_row
 
@@ -511,14 +526,11 @@ def worker(symbol):
             if state["last_processed_ts"] is not None and pd.to_datetime(state["last_processed_ts"]) >= closed_ts:
                 time.sleep(30); continue
 
+            # funding series (safe fallback to zeros to avoid log spam)
             funding_series = None
             if INCLUDE_FUNDING:
-               fdf = fetch_funding_history(exchange, symbol, int(h1.index[0].timestamp()*1000), int(h1.index[-1].timestamp()*1000))
-               if fdf is not None and not fdf.empty:
-                   funding_series = align_funding_to_index(h1.index, fdf)
-               else:
-                    funding_series = pd.Series(0.0, index=h1.index)  # ✅ safe fallback
-
+                fdf = fetch_funding_history(exchange, symbol, int(h1.index[0].timestamp()*1000), int(h1.index[-1].timestamp()*1000))
+                funding_series = align_funding_to_index(h1.index, fdf) if (fdf is not None and not fdf.empty) else pd.Series(0.0, index=h1.index)
 
             state, trade = process_bar(symbol, h1.iloc[:-1], h4.iloc[:-1], state, exchange=exchange, funding_series=funding_series)
             if trade is not None:
@@ -526,10 +538,9 @@ def worker(symbol):
 
             save_state(state_file, state)
 
-            # sleep to just after next bar close (fix tz mismatch: make both aware-or-both-naive)
+            # sleep till just after next bar close
             next_close = h1.index[-1] + (h1.index[-1] - h1.index[-2])  # tz-naive
             now_utc = datetime.now(timezone.utc)
-            # make next_close tz-aware in UTC so subtraction works
             if getattr(next_close, "tzinfo", None) is None:
                 next_close = next_close.replace(tzinfo=timezone.utc)
             sleep_sec = (next_close - now_utc).total_seconds() + 5
@@ -550,7 +561,6 @@ def worker(symbol):
 # DAILY SUMMARY (IST 20:00)
 # =========================
 def ist_now():
-    # Asia/Kolkata = UTC+5:30; represent as fixed offset
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
 def generate_daily_summary():
@@ -647,4 +657,3 @@ Funding: {"ON" if INCLUDE_FUNDING else "OFF"}
 
 if __name__ == "__main__":
     main()
-
