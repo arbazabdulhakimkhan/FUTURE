@@ -202,7 +202,7 @@ def load_state(state_file):
     if os.path.exists(state_file):
         with open(state_file, "r") as f:
             s = json.load(f)
-        # parse timestamps
+        # parse timestamps -> naive UTC (to match our OHLC indices)
         for k in ["entry_time", "last_processed_ts", "last_exit_time"]:
             if s.get(k):
                 s[k] = pd.to_datetime(s[k], utc=True).tz_convert(None)
@@ -286,7 +286,10 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
 
     # funding at this bar (if we were holding)
     if INCLUDE_FUNDING and state["position"] != 0 and funding_series is not None:
-        rate = float(funding_series.iloc[i]) if i < len(funding_series) else 0.0
+        try:
+            rate = float(funding_series.iloc[i]) if i < len(funding_series) else 0.0
+        except Exception:
+            rate = 0.0
         if rate != 0.0 and state["entry_price"] and state["entry_size"]:
             notional = abs(state["entry_price"] * state["entry_size"])
             # longs pay when rate>0; shorts receive. (PnL impact negative when you pay).
@@ -295,10 +298,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
 
     # drawdown stop
     state["peak_equity"] = max(state["peak_equity"], state["capital"])
-    if state["peak_equity"] > 0:
-        dd = (state["peak_equity"] - state["capital"]) / state["peak_equity"]
-    else:
-        dd = 0.0
+    dd = (state["peak_equity"] - state["capital"]) / state["peak_equity"] if state["peak_equity"] > 0 else 0.0
     if dd >= MAX_DRAWDOWN and state["position"] != 0:
         # force close at price
         side = "sell" if state["position"] == 1 else "buy"
@@ -324,6 +324,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
         }
         # reset
         state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"bearish_count":0})
+        state["last_exit_time"] = ts  # ← track for cooldown
         return state, row
 
     trade_row = None
@@ -387,6 +388,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 "Exit_Reason": exit_reason, "Capital_After": round(state["capital"],2), "Mode": MODE
             }
             state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0})
+            state["last_exit_time"] = ts  # ← update cooldown anchor
 
             emoji = "💚" if pnl>0 else "❤️"
             send_telegram_fut(f"{emoji} EXIT {symbol} {exit_reason} @ {exit_price:.4f} | PnL ${pnl:.2f}")
@@ -395,9 +397,13 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
     if state["position"] == 0:
         # cooldown
         if COOLDOWN_HOURS>0 and state.get("last_exit_time") is not None:
-            if (ts - state["last_exit_time"]).total_seconds()/3600 < COOLDOWN_HOURS:
-                state["last_processed_ts"] = ts
-                return state, trade_row
+            try:
+                if (ts - state["last_exit_time"]).total_seconds()/3600 < COOLDOWN_HOURS:
+                    state["last_processed_ts"] = ts
+                    return state, trade_row
+            except Exception:
+                # if parsing weird, just allow entry next bar
+                pass
 
         bullish_sweep = (price > open_price) and (price > prev_close)
         bearish_sweep = (price < open_price) and (price < prev_close)
@@ -501,14 +507,16 @@ def worker(symbol):
                 time.sleep(30); continue
 
             # act on last CLOSED bar
-            closed_ts = h1.index[-2]
+            closed_ts = h1.index[-2]  # tz-naive (by design)
             if state["last_processed_ts"] is not None and pd.to_datetime(state["last_processed_ts"]) >= closed_ts:
-                # wait till next hour
                 time.sleep(30); continue
 
             funding_series = None
             if INCLUDE_FUNDING:
-                fdf = fetch_funding_history(exchange, symbol, int(h1.index[0].timestamp()*1000), int(h1.index[-1].timestamp()*1000))
+                try:
+                    fdf = fetch_funding_history(exchange, symbol, int(h1.index[0].timestamp()*1000), int(h1.index[-1].timestamp()*1000))
+                except Exception:
+                    fdf = None
                 funding_series = align_funding_to_index(h1.index, fdf)
 
             state, trade = process_bar(symbol, h1.iloc[:-1], h4.iloc[:-1], state, exchange=exchange, funding_series=funding_series)
@@ -517,9 +525,13 @@ def worker(symbol):
 
             save_state(state_file, state)
 
-            # sleep to just after next bar close (hourly cadence)
-            next_close = h1.index[-1] + (h1.index[-1] - h1.index[-2])
-            sleep_sec = (next_close - datetime.now(timezone.utc)).total_seconds() + 5
+            # sleep to just after next bar close (fix tz mismatch: make both aware-or-both-naive)
+            next_close = h1.index[-1] + (h1.index[-1] - h1.index[-2])  # tz-naive
+            now_utc = datetime.now(timezone.utc)
+            # make next_close tz-aware in UTC so subtraction works
+            if getattr(next_close, "tzinfo", None) is None:
+                next_close = next_close.replace(tzinfo=timezone.utc)
+            sleep_sec = (next_close - now_utc).total_seconds() + 5
             if sleep_sec < 10: sleep_sec = 10
             if sleep_sec > 3600: sleep_sec = SLEEP_CAP
             time.sleep(sleep_sec)
@@ -543,10 +555,9 @@ def ist_now():
 def generate_daily_summary():
     try:
         now_ist = ist_now()
-        today_ist = now_ist.date()
         start_ist = datetime(now_ist.year, now_ist.month, now_ist.day, 0, 0, 0, tzinfo=now_ist.tzinfo)
         end_ist   = datetime(now_ist.year, now_ist.month, now_ist.day, 23, 59, 59, tzinfo=now_ist.tzinfo)
-        start_utc = start_ist.astimezone(timezone.utc).replace(tzinfo=None)
+        start_utc = start_ist.astimezone(timezone.utc).replace(tzinfo=None)  # tz-naive UTC
         end_utc   = end_ist.astimezone(timezone.utc).replace(tzinfo=None)
 
         lines = [f"📊 FUTURES DAILY SUMMARY — {now_ist.strftime('%Y-%m-%d %I:%M %p IST')}", "-"*60]
@@ -566,7 +577,7 @@ def generate_daily_summary():
             if os.path.exists(trades_csv):
                 df = pd.read_csv(trades_csv)
                 if len(df):
-                    df['Exit_DateTime'] = pd.to_datetime(df['Exit_DateTime'], utc=True).dt.tz_convert(None)
+                    df['Exit_DateTime'] = pd.to_datetime(df['Exit_DateTime'], utc=True).tz_convert(None)
                     today = df[(df['Exit_DateTime'] >= start_utc) & (df['Exit_DateTime'] <= end_utc)]
                     n_trades_today = len(today)
                     wins_today = int(today['Win'].sum()) if n_trades_today else 0
@@ -599,7 +610,7 @@ def summary_scheduler():
                 generate_daily_summary()
                 last_sent_date = now.date()
             time.sleep(60)
-        except Exception as e:
+        except Exception:
             time.sleep(60)
 
 # =========================
