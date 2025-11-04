@@ -513,11 +513,12 @@ def worker(symbol):
 
             funding_series = None
             if INCLUDE_FUNDING:
-                try:
-                    fdf = fetch_funding_history(exchange, symbol, int(h1.index[0].timestamp()*1000), int(h1.index[-1].timestamp()*1000))
-                except Exception:
-                    fdf = None
-                funding_series = align_funding_to_index(h1.index, fdf)
+               fdf = fetch_funding_history(exchange, symbol, int(h1.index[0].timestamp()*1000), int(h1.index[-1].timestamp()*1000))
+               if fdf is not None and not fdf.empty:
+                   funding_series = align_funding_to_index(h1.index, fdf)
+               else:
+                    funding_series = pd.Series(0.0, index=h1.index)  # ✅ safe fallback
+
 
             state, trade = process_bar(symbol, h1.iloc[:-1], h4.iloc[:-1], state, exchange=exchange, funding_series=funding_series)
             if trade is not None:
@@ -646,3 +647,4 @@ Funding: {"ON" if INCLUDE_FUNDING else "OFF"}
 
 if __name__ == "__main__":
     main()
+
