@@ -1,3 +1,4 @@
+# trading_bot.py
 import os, time, json, traceback, threading
 from datetime import datetime, timedelta, timezone
 import ccxt
@@ -311,6 +312,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             rate = 0.0
         if rate != 0.0 and state["entry_price"] and state["entry_size"]:
             notional = abs(state["entry_price"] * state["entry_size"])
+            # longs pay when rate>0; shorts receive; we apply negative when paid
             fee = notional * rate * (1 if state["position"] == 1 else -1) * (-1)
             state["capital"] += fee
 
@@ -587,12 +589,22 @@ def generate_daily_summary():
 
             if os.path.exists(trades_csv):
                 df = pd.read_csv(trades_csv)
-                if len(df):
-                    df['Exit_DateTime'] = pd.to_datetime(df['Exit_DateTime'], utc=True).tz_convert(None)
-                    today = df[(df['Exit_DateTime'] >= start_utc) & (df['Exit_DateTime'] <= end_utc)]
-                    n_trades_today = len(today)
-                    wins_today = int(today['Win'].sum()) if n_trades_today else 0
-                    pnl_today_sym = float(today['PnL_$'].sum()) if n_trades_today else 0.0
+
+                # ✅ SAFETY: handle empty CSV or missing/invalid timestamp column
+                if df.empty or 'Exit_DateTime' not in df.columns:
+                    today = df.iloc[0:0]
+                else:
+                    try:
+                        df['Exit_DateTime'] = pd.to_datetime(df['Exit_DateTime'], utc=True).dt.tz_convert(None)
+                        today = df[(df['Exit_DateTime'] >= start_utc) & (df['Exit_DateTime'] <= end_utc)]
+                    except Exception:
+                        today = df.iloc[0:0]
+
+                n_trades_today = len(today)
+                wins_today = int(today['Win'].sum()) if n_trades_today else 0
+                pnl_today_sym = float(today['PnL_$'].sum()) if n_trades_today else 0.0
+
+                if not df.empty:
                     pnl_all = float(df['PnL_$'].sum())
                     wins = int(df['Win'].sum()); losses = len(df)-wins
                     wr = (wins/len(df)*100) if len(df) else 0.0
