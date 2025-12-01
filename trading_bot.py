@@ -517,12 +517,15 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     state["entry_tp"] = tp
                     state["entry_time"] = ts
                     state["entry_size"] = size
+                    state["entry_bar_index"] = i
                     state["bearish_count"] = 0
-                    state["entry_bar_index"] = i  # ✅ FIX #1: Track entry bar
+
+                    state["last_processed_ts"] = ts   # <-- must be set now
+
+                    save_state(state_file, state)     # <-- FIX THAT PREVENTS DOUBLE ENTRY
 
                     pos_val = abs(entry_price_used * size)
-                    # ✅ FIX #4: Removed slippage deduction (already in live fill)
-                    state["capital"] -= pos_val*FEE_RATE
+                    state["capital"] -= pos_val * FEE_RATE
 
                     tag = "LONG" if signal==1 else "SHORT"
                     send_telegram_fut(f"🚀 ENTRY {symbol} {tag} @ {entry_price_used:.4f} | SL {sl:.4f} | TP {tp:.4f} | RR {rr:.1f}")
@@ -721,4 +724,5 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
 
 if __name__ == "__main__":
     main()
+
 
