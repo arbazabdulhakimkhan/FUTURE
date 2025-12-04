@@ -768,5 +768,3 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
 if __name__ == "__main__":
     main()
 
-
-
